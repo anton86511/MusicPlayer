@@ -2,7 +2,11 @@ name: Build IPA
 
 on:
   push:
+    branches: [main]
   workflow_dispatch:
+
+permissions:
+  contents: write
 
 jobs:
   build:
@@ -48,3 +52,13 @@ jobs:
         with:
           name: MusicPlayer-ipa
           path: MusicPlayer.ipa
+
+      - name: 發布到 Releases（可直接下載 .ipa）
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        run: |
+          gh release delete latest --yes --cleanup-tag || true
+          gh release create latest MusicPlayer.ipa \
+            --target "$GITHUB_SHA" \
+            --title "最新版 MusicPlayer" \
+            --notes "自動打包於 $(date -u '+%Y-%m-%d %H:%M UTC')。直接下載 MusicPlayer.ipa，用 SideStore 安裝即可。"
