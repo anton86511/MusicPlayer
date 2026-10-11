@@ -9,6 +9,7 @@ struct Track: Identifiable, Equatable {
     let artist: String
     let duration: TimeInterval
     let artwork: UIImage?
+    var fileName: String { url.lastPathComponent }
 
     static func == (lhs: Track, rhs: Track) -> Bool { lhs.id == rhs.id }
 
@@ -36,6 +37,12 @@ struct Track: Identifiable, Equatable {
                     break
                 }
             }
+        }
+        // 檔名是「歌手 - 歌名」格式時，自動拆開
+        if artist == "未知歌手", let r = title.range(of: " - ") {
+            let a = title[..<r.lowerBound].trimmingCharacters(in: .whitespaces)
+            let t = title[r.upperBound...].trimmingCharacters(in: .whitespaces)
+            if !a.isEmpty && !t.isEmpty { artist = a; title = t }
         }
         return Track(id: url, title: title, artist: artist, duration: duration, artwork: artwork)
     }

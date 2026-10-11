@@ -3,8 +3,14 @@ import AVFoundation
 import MediaPlayer
 import UIKit
 
+extension Notification.Name {
+    /// 本機音樂開始播放（用來暫停 YouTube 網頁）
+    static let localPlaybackStarted = Notification.Name("localPlaybackStarted")
+}
+
 @MainActor
-final class PlayerManager: NSObject, ObservableObject, AVAudioPlayerDelegate {
+final class PlayerManager: ObservableObject {
+    // MARK: 狀態
     @Published private(set) var tracks: [Track] = []
     @Published private(set) var currentTrack: Track?
     @Published private(set) var isPlaying = false
@@ -13,12 +19,42 @@ final class PlayerManager: NSObject, ObservableObject, AVAudioPlayerDelegate {
     @Published var isShuffle = false
     @Published var repeatMode: RepeatMode = .off
     @Published var errorMessage: String?
+    @Published private(set) var sleepTimerEnd: Date?
 
-    private var player: AVAudioPlayer?
+    @Published var favorites: Set<String> = Set(UserDefaults.standard.stringArray(forKey: "favorites") ?? []) {
+        didSet { UserDefaults.standard.set(Array(favorites), forKey: "favorites") }
+    }
+
+    @Published var playbackRate: Float = 1.0 {
+        didSet { timePitch.rate = playbackRate; updateNowPlaying() }
+    }
+
+    // MARK: 等化器設定
+    static let eqFrequencies: [Float] = [32, 64, 125, 250, 500, 1000, 2000, 4000, 8000, 16000]
+
+    @Published var eqEnabled: Bool = UserDefaults.standard.bool(forKey: "eqEnabled") {
+        didSet { applyEQ(); saveEQ() }
+    }
+    @Published var eqGains: [Float] = PlayerManager.loadGains() {
+        didSet { applyEQ(); saveEQ() }
+    }
+    @Published var eqPresetName: String = UserDefaults.standard.string(forKey: "eqPreset") ?? "平坦" {
+        didSet { saveEQ() }
+    }
+
+    // MARK: 音訊引擎
+    private let engine = AVAudioEngine()
+    private let node = AVAudioPlayerNode()
+    private let eq = AVAudioUnitEQ(numberOfBands: 10)
+    private let timePitch = AVAudioUnitTimePitch()
+    private var chainFormat: AVAudioFormat?
+    private var audioFile: AVAudioFile?
+    private var seekFrame: AVAudioFramePosition = 0
+    private var generation = 0
     private var timer: Timer?
+
     private let supportedExtensions: Set<String> = ["mp3", "m4a", "aac", "wav", "aiff", "aif", "caf", "flac", "mp4"]
 
-    /// 音樂存在 App 的「文件」資料夾，可在「檔案」App 中看到
     private var musicFolder: URL {
         FileManager.default.urls(for: .documentDirectory, in: .userDomainMask)[0]
     }
@@ -28,10 +64,12 @@ final class PlayerManager: NSObject, ObservableObject, AVAudioPlayerDelegate {
         return tracks.firstIndex(of: c)
     }
 
-    override init() {
-        super.init()
+    init() {
+        setupEngine()
+        applyEQ()
         configureAudioSession()
         configureRemoteCommands()
+        startTimer()
         Task { await reloadLibrary() }
     }
 
@@ -75,66 +113,95 @@ final class PlayerManager: NSObject, ObservableObject, AVAudioPlayerDelegate {
 
     func delete(_ track: Track) {
         if track == currentTrack {
-            player?.stop()
-            player = nil
+            generation += 1
+            node.stop()
+            audioFile = nil
             currentTrack = nil
             isPlaying = false
-            stopTimer()
+            currentTime = 0
+            duration = 0
             updateNowPlaying()
         }
         try? FileManager.default.removeItem(at: track.url)
         tracks.removeAll { $0 == track }
+        favorites.remove(track.fileName)
+    }
+
+    func isFavorite(_ track: Track) -> Bool { favorites.contains(track.fileName) }
+
+    func toggleFavorite(_ track: Track) {
+        if favorites.contains(track.fileName) {
+            favorites.remove(track.fileName)
+        } else {
+            favorites.insert(track.fileName)
+        }
     }
 
     // MARK: - 播放控制
 
     func play(track: Track) {
         do {
-            try? AVAudioSession.sharedInstance().setActive(true)
-            let p = try AVAudioPlayer(contentsOf: track.url)
-            p.delegate = self
-            p.prepareToPlay()
-            player?.stop()
-            player = p
+            let file = try AVAudioFile(forReading: track.url)
+            generation += 1
+            node.stop()
+            prepareChain(for: file.processingFormat)
+            audioFile = file
             currentTrack = track
-            duration = p.duration
+            duration = Double(file.length) / file.processingFormat.sampleRate
             currentTime = 0
-            p.play()
-            isPlaying = true
-            startTimer()
+            scheduleFrom(0)
+            if playNode() {
+                isPlaying = true
+                NotificationCenter.default.post(name: .localPlaybackStarted, object: nil)
+            }
             updateNowPlaying()
         } catch {
             errorMessage = "無法播放：\(track.title)"
         }
     }
 
+    /// 播放清單中的某一組歌（例如只播最愛）
+    func playAll(_ list: [Track], shuffle: Bool) {
+        guard !list.isEmpty else { return }
+        isShuffle = shuffle
+        play(track: shuffle ? list.randomElement()! : list[0])
+    }
+
     func togglePlayPause() {
-        guard let p = player else {
-            if let first = tracks.first { play(track: first) }
-            return
-        }
-        if p.isPlaying { pause() } else { resume() }
+        if isPlaying { pause() } else { resume() }
     }
 
     func pause() {
-        player?.pause()
+        guard isPlaying else { return }
+        node.pause()
         isPlaying = false
         updateNowPlaying()
     }
 
     func resume() {
-        guard let p = player else { togglePlayPause(); return }
-        try? AVAudioSession.sharedInstance().setActive(true)
-        p.play()
-        isPlaying = p.isPlaying
-        startTimer()
+        guard audioFile != nil else {
+            if let first = tracks.first { play(track: first) }
+            return
+        }
+        let engineWasStopped = !engine.isRunning
+        if engineWasStopped {
+            // 系統中斷或耳機切換後，引擎會被停止，需要重新排程
+            scheduleFrom(frame(for: currentTime))
+        }
+        if playNode() {
+            isPlaying = true
+            NotificationCenter.default.post(name: .localPlaybackStarted, object: nil)
+        }
         updateNowPlaying()
     }
 
     func seek(to time: TimeInterval) {
-        guard let p = player else { return }
-        p.currentTime = max(0, min(time, p.duration))
-        currentTime = p.currentTime
+        guard audioFile != nil else { return }
+        let t = max(0, min(time, duration))
+        let wasPlaying = isPlaying
+        scheduleFrom(frame(for: t))
+        currentTime = t
+        if wasPlaying { _ = playNode() }
         updateNowPlaying()
     }
 
@@ -159,11 +226,132 @@ final class PlayerManager: NSObject, ObservableObject, AVAudioPlayerDelegate {
 
     func cycleRepeat() { repeatMode = repeatMode.next }
 
+    // MARK: - 睡眠定時
+
+    func setSleepTimer(minutes: Int?) {
+        sleepTimerEnd = minutes.map { Date().addingTimeInterval(Double($0) * 60) }
+    }
+
+    var sleepRemainingMinutes: Int? {
+        guard let end = sleepTimerEnd else { return nil }
+        return max(1, Int(ceil(end.timeIntervalSinceNow / 60)))
+    }
+
+    // MARK: - 等化器
+
+    func applyPreset(_ preset: EQPreset) {
+        eqGains = preset.gains
+        eqPresetName = preset.name
+        if !eqEnabled { eqEnabled = true }
+    }
+
+    func setGain(_ gain: Float, band: Int) {
+        guard eqGains.indices.contains(band) else { return }
+        eqGains[band] = gain
+        eqPresetName = "自訂"
+    }
+
+    private func applyEQ() {
+        eq.bypass = !eqEnabled
+        for (i, band) in eq.bands.enumerated() where i < eqGains.count {
+            band.gain = eqGains[i]
+        }
+        // 增益太高時降低整體音量，避免破音
+        let maxBoost = eqGains.max() ?? 0
+        eq.globalGain = eqEnabled ? -max(0, maxBoost) * 0.5 : 0
+    }
+
+    private func saveEQ() {
+        let d = UserDefaults.standard
+        d.set(eqEnabled, forKey: "eqEnabled")
+        d.set(eqGains.map { Double($0) }, forKey: "eqGains")
+        d.set(eqPresetName, forKey: "eqPreset")
+    }
+
+    nonisolated private static func loadGains() -> [Float] {
+        if let arr = UserDefaults.standard.array(forKey: "eqGains") as? [Double], arr.count == 10 {
+            return arr.map { Float($0) }
+        }
+        return Array(repeating: 0, count: 10)
+    }
+
+    // MARK: - 引擎內部
+
+    private func setupEngine() {
+        for (i, band) in eq.bands.enumerated() {
+            band.filterType = .parametric
+            band.frequency = Self.eqFrequencies[i]
+            band.bandwidth = 1.0
+            band.gain = 0
+            band.bypass = false
+        }
+        engine.attach(node)
+        engine.attach(timePitch)
+        engine.attach(eq)
+        _ = engine.mainMixerNode
+    }
+
+    /// 依照歌曲格式（取樣率、聲道）連接 播放器 → 變速 → 等化器 → 輸出
+    private func prepareChain(for format: AVAudioFormat) {
+        if let f = chainFormat, f.sampleRate == format.sampleRate, f.channelCount == format.channelCount {
+            return
+        }
+        if engine.isRunning { engine.stop() }
+        engine.disconnectNodeOutput(node)
+        engine.disconnectNodeOutput(timePitch)
+        engine.disconnectNodeOutput(eq)
+        engine.connect(node, to: timePitch, format: format)
+        engine.connect(timePitch, to: eq, format: format)
+        engine.connect(eq, to: engine.mainMixerNode, format: format)
+        chainFormat = format
+    }
+
+    @discardableResult
+    private func playNode() -> Bool {
+        if !engine.isRunning {
+            do {
+                try AVAudioSession.sharedInstance().setActive(true)
+                engine.prepare()
+                try engine.start()
+            } catch {
+                errorMessage = "無法啟動音訊"
+                return false
+            }
+        }
+        node.play()
+        return true
+    }
+
+    private func frame(for time: TimeInterval) -> AVAudioFramePosition {
+        guard let file = audioFile else { return 0 }
+        return AVAudioFramePosition(time * file.processingFormat.sampleRate)
+    }
+
+    private func scheduleFrom(_ frame: AVAudioFramePosition) {
+        guard let file = audioFile else { return }
+        generation += 1
+        let gen = generation
+        node.stop()
+        let start = max(0, min(frame, file.length))
+        seekFrame = start
+        let remaining = file.length - start
+        guard remaining > 0 else { return }
+        node.scheduleSegment(file, startingFrame: start, frameCount: AVAudioFrameCount(remaining),
+                             at: nil, completionCallbackType: .dataPlayedBack) { [weak self] _ in
+            Task { @MainActor in
+                guard let self, self.generation == gen else { return }
+                self.handleFinished()
+            }
+        }
+    }
+
     private func handleFinished() {
         switch repeatMode {
         case .one:
-            seek(to: 0)
-            player?.play()
+            scheduleFrom(0)
+            currentTime = 0
+            _ = playNode()
+            updateNowPlaying()
         case .all:
             next()
         case .off:
@@ -173,31 +361,33 @@ final class PlayerManager: NSObject, ObservableObject, AVAudioPlayerDelegate {
                 play(track: tracks[i + 1])
             } else {
                 isPlaying = false
-                seek(to: 0)
-                stopTimer()
+                scheduleFrom(0)
+                currentTime = 0
+                updateNowPlaying()
             }
         }
     }
 
-    nonisolated func audioPlayerDidFinishPlaying(_ player: AVAudioPlayer, successfully flag: Bool) {
-        Task { @MainActor in self.handleFinished() }
-    }
-
-    // MARK: - 計時器
+    // MARK: - 計時器（進度、睡眠定時）
 
     private func startTimer() {
-        stopTimer()
-        timer = Timer.scheduledTimer(withTimeInterval: 0.5, repeats: true) { [weak self] _ in
-            Task { @MainActor in
-                guard let self, let p = self.player else { return }
-                self.currentTime = p.currentTime
-            }
+        timer?.invalidate()
+        timer = Timer.scheduledTimer(withTimeInterval: 0.25, repeats: true) { [weak self] _ in
+            Task { @MainActor in self?.tick() }
         }
     }
 
-    private func stopTimer() {
-        timer?.invalidate()
-        timer = nil
+    private func tick() {
+        if isPlaying, let file = audioFile,
+           let nodeTime = node.lastRenderTime,
+           let playerTime = node.playerTime(forNodeTime: nodeTime) {
+            let t = Double(seekFrame + playerTime.sampleTime) / file.processingFormat.sampleRate
+            currentTime = min(max(0, t), duration)
+        }
+        if let end = sleepTimerEnd, Date() >= end {
+            sleepTimerEnd = nil
+            pause()
+        }
     }
 
     // MARK: - 背景播放、鎖定畫面
@@ -218,11 +408,33 @@ final class PlayerManager: NSObject, ObservableObject, AVAudioPlayerDelegate {
             Task { @MainActor in
                 guard let self else { return }
                 if type == .began {
+                    if self.isPlaying { self.node.pause() }
                     self.isPlaying = false
                     self.updateNowPlaying()
                 } else if shouldResume {
                     self.resume()
                 }
+            }
+        }
+
+        // 拔掉耳機時自動暫停
+        NotificationCenter.default.addObserver(
+            forName: AVAudioSession.routeChangeNotification, object: session, queue: .main
+        ) { [weak self] note in
+            guard let raw = note.userInfo?[AVAudioSessionRouteChangeReasonKey] as? UInt,
+                  AVAudioSession.RouteChangeReason(rawValue: raw) == .oldDeviceUnavailable else { return }
+            Task { @MainActor in self?.pause() }
+        }
+
+        // 音訊硬體設定改變（例如藍牙切換）時重新啟動引擎
+        NotificationCenter.default.addObserver(
+            forName: .AVAudioEngineConfigurationChange, object: engine, queue: .main
+        ) { [weak self] _ in
+            Task { @MainActor in
+                guard let self, self.audioFile != nil else { return }
+                let wasPlaying = self.isPlaying
+                self.isPlaying = false
+                if wasPlaying { self.resume() }
             }
         }
     }
@@ -262,7 +474,7 @@ final class PlayerManager: NSObject, ObservableObject, AVAudioPlayerDelegate {
             MPMediaItemPropertyArtist: t.artist,
             MPMediaItemPropertyPlaybackDuration: duration,
             MPNowPlayingInfoPropertyElapsedPlaybackTime: currentTime,
-            MPNowPlayingInfoPropertyPlaybackRate: isPlaying ? 1.0 : 0.0,
+            MPNowPlayingInfoPropertyPlaybackRate: isPlaying ? Double(playbackRate) : 0.0,
         ]
         if let img = t.artwork {
             info[MPMediaItemPropertyArtwork] = Self.makeArtwork(img)

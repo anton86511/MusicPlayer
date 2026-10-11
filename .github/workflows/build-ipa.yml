@@ -18,6 +18,7 @@ jobs:
 
       - name: 編譯（不簽名）
         run: |
+          set +e
           xcodebuild \
             -project MusicPlayer.xcodeproj \
             -scheme MusicPlayer \
@@ -28,7 +29,13 @@ jobs:
             CODE_SIGNING_ALLOWED=NO \
             CODE_SIGNING_REQUIRED=NO \
             CODE_SIGN_IDENTITY="" \
-            build
+            build > build.log 2>&1
+          status=$?
+          tail -40 build.log
+          grep -E "error:" build.log | sort -u | head -40 | while IFS= read -r line; do
+            echo "::error::$line"
+          done
+          exit $status
 
       - name: 打包成 IPA
         run: |

@@ -1,15 +1,21 @@
 import SwiftUI
 import UniformTypeIdentifiers
 
-struct ContentView: View {
+struct LibraryView: View {
+    enum Filter: String, CaseIterable { case all = "全部", favorites = "最愛" }
+
     @EnvironmentObject var player: PlayerManager
+    @EnvironmentObject var lyrics: LyricsStore
     @State private var showImporter = false
     @State private var showNowPlaying = false
     @State private var searchText = ""
+    @State private var filter: Filter = .all
 
     private var filtered: [Track] {
-        guard !searchText.isEmpty else { return player.tracks }
-        return player.tracks.filter {
+        var list = player.tracks
+        if filter == .favorites { list = list.filter { player.isFavorite($0) } }
+        guard !searchText.isEmpty else { return list }
+        return list.filter {
             $0.title.localizedCaseInsensitiveContains(searchText) ||
             $0.artist.localizedCaseInsensitiveContains(searchText)
         }
@@ -22,16 +28,55 @@ struct ContentView: View {
                     EmptyLibraryView { showImporter = true }
                 } else {
                     List {
-                        ForEach(filtered) { track in
-                            TrackRow(track: track,
-                                     isCurrent: player.currentTrack == track,
-                                     isPlaying: player.isPlaying)
-                                .contentShape(Rectangle())
-                                .onTapGesture { player.play(track: track) }
+                        Section {
+                            Picker("篩選", selection: $filter) {
+                                ForEach(Filter.allCases, id: \.self) { Text($0.rawValue).tag($0) }
+                            }
+                            .pickerStyle(.segmented)
+                            HStack(spacing: 12) {
+                                Button { player.playAll(filtered, shuffle: false) } label: {
+                                    Label("播放", systemImage: "play.fill").frame(maxWidth: .infinity)
+                                }
+                                Button { player.playAll(filtered, shuffle: true) } label: {
+                                    Label("隨機播放", systemImage: "shuffle").frame(maxWidth: .infinity)
+                                }
+                            }
+                            .buttonStyle(.bordered)
+                            .disabled(filtered.isEmpty)
                         }
-                        .onDelete { offsets in
-                            let items = offsets.map { filtered[$0] }
-                            items.forEach { player.delete($0) }
+                        .listRowSeparator(.hidden)
+
+                        Section {
+                            ForEach(filtered) { track in
+                                TrackRow(track: track,
+                                         isCurrent: player.currentTrack == track,
+                                         isPlaying: player.isPlaying,
+                                         isFavorite: player.isFavorite(track))
+                                    .contentShape(Rectangle())
+                                    .onTapGesture { player.play(track: track) }
+                                    .swipeActions(edge: .leading) {
+                                        Button { player.toggleFavorite(track) } label: {
+                                            Label("最愛", systemImage: player.isFavorite(track) ? "heart.slash" : "heart")
+                                        }
+                                        .tint(.pink)
+                                    }
+                                    .swipeActions(edge: .trailing) {
+                                        Button(role: .destructive) { player.delete(track) } label: {
+                                            Label("刪除", systemImage: "trash")
+                                        }
+                                    }
+                                    .contextMenu {
+                                        Button { player.toggleFavorite(track) } label: {
+                                            Label(player.isFavorite(track) ? "取消最愛" : "加入最愛",
+                                                  systemImage: player.isFavorite(track) ? "heart.slash" : "heart")
+                                        }
+                                        Button(role: .destructive) { player.delete(track) } label: {
+                                            Label("刪除", systemImage: "trash")
+                                        }
+                                    }
+                            }
+                        } footer: {
+                            Text("共 \(filtered.count) 首 · 向右滑加入最愛，向左滑刪除")
                         }
                     }
                     .listStyle(.plain)
@@ -59,7 +104,9 @@ struct ContentView: View {
             if case .success(let urls) = result { player.importFiles(urls) }
         }
         .sheet(isPresented: $showNowPlaying) {
-            NowPlayingView().environmentObject(player)
+            NowPlayingView()
+                .environmentObject(player)
+                .environmentObject(lyrics)
         }
         .alert("發生錯誤", isPresented: Binding(
             get: { player.errorMessage != nil },
@@ -97,6 +144,7 @@ struct TrackRow: View {
     let track: Track
     let isCurrent: Bool
     let isPlaying: Bool
+    var isFavorite: Bool = false
 
     var body: some View {
         HStack(spacing: 12) {
@@ -112,6 +160,9 @@ struct TrackRow: View {
                     .lineLimit(1)
             }
             Spacer()
+            if isFavorite {
+                Image(systemName: "heart.fill").font(.caption).foregroundStyle(.pink)
+            }
             if isCurrent {
                 Image(systemName: isPlaying ? "speaker.wave.2.fill" : "speaker.fill")
                     .foregroundStyle(.pink)
