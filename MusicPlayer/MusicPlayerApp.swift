@@ -28,7 +28,7 @@ struct RootView: View {
             LibraryView()
                 .tabItem { Label("音樂庫", systemImage: "music.note.list") }
             YouTubeView()
-                .tabItem { Label("YouTube", systemImage: "play.rectangle.fill") }
+                .tabItem { Label("YouTube Music", systemImage: "play.rectangle.fill") }
         }
     }
 }

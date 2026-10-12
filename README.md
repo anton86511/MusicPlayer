@@ -11,6 +11,8 @@
 - 搜尋歌曲、左滑刪除、下拉重新整理
 - 等化器、同步歌詞、播放速度、睡眠定時、AirPlay、我的最愛
 - YouTube / YouTube Music 分頁：倒讚數、子母畫面按鈕、高畫質優先（實驗性）
+- 等化器、同步歌詞、播放速度、睡眠定時、AirPlay、我的最愛
+- YouTube Music 分頁（可登入自己的帳號）與子母畫面按鈕
 - 支援 iOS 16 以上
 
 ## 專案結構
@@ -58,3 +60,6 @@ open MusicPlayer.xcodeproj
 - 倒讚數資料來自 [Return YouTube Dislike](https://returnyoutubedislike.com)。
 - 歌詞資料來自 [LRCLIB](https://lrclib.net)。
 - YouTube 分頁的功能構想參考 PoomSmart 的 YouPiP、YTUHD、Return YouTube Dislikes；本專案是以網頁版**重新實作**，沒有使用這些專案的程式碼，也不修改官方 YouTube App。
+
+## 致謝
+- 歌詞資料來自 [LRCLIB](https://lrclib.net)。
